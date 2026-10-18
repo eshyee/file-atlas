@@ -31,6 +31,20 @@ def test_generated_paths_reject_symlinked_parent(tmp_path):
         release.generated_path(tmp_path, 'build', 'windows-release')
 
 
+@pytest.mark.parametrize('installed', [False, True])
+def test_tk_license_supports_python_distributions_without_installed_notice(tmp_path, monkeypatch, installed):
+    base = tmp_path / 'python'
+    monkeypatch.setattr(release.sys, 'base_prefix', str(base))
+    fallback = tmp_path / 'scripts' / 'licenses' / 'Tk8.6-LICENSE.txt'
+    fallback.parent.mkdir(parents=True)
+    fallback.write_text('Bundled upstream Tk license fixture', encoding='utf-8')
+    if installed:
+        notice = base / 'tcl' / 'tk8.6' / 'license.terms'
+        notice.parent.mkdir(parents=True)
+        notice.write_text('Installed Tk license fixture', encoding='utf-8')
+    assert release._tk_license_path(tmp_path) == (notice if installed else fallback)
+
+
 def prepare_inputs(workspace):
     (workspace / 'dist').mkdir()
     (workspace / 'dist' / 'FileAtlas.exe').write_bytes(b'fake EXE; never executed')

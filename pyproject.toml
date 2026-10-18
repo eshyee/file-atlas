@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fileatlas"
-version = "1.1.0"
+version = "1.1.1"
 description = "归序 File Atlas: local file organization, exact deduplication, media preview and face indexing"
 readme = "readme.md"
 requires-python = ">=3.11"
@@ -14,7 +14,7 @@ dependencies = ["Pillow>=11.0,<14"]
 [project.optional-dependencies]
 desktop = ["pywebview>=5,<7"]
 heif = ["pillow-heif>=0.21"]
-faces = ["numpy>=1.26,<3", "opencv-python-headless>=4.10,<5"]
+faces = ["numpy>=1.26,<3", "opencv-python-headless>=4.11,<5"]
 dev = ["pytest>=8,<10", "pyinstaller>=6.11,<7"]
 
 [project.scripts]

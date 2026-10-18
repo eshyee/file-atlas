@@ -107,7 +107,13 @@ export default function App() {
   const subtitle = view === 'history' ? '查看整理结果，让每一步操作清晰可查。' : view === 'guide' ? '了解整理方式与保护机制，让重要内容一直在。' : view === 'faces' ? '在本机识别相似人脸，建立只属于你的照片索引。' : config.mode === 'dedup' ? '精确识别完全相同的文件，先看清，再安全隔离。' : config.mode === 'merge' ? '把分散在不同文件夹、不同磁盘的内容，归并到一个位置。' : '将散落的文件分类归档，找出重复，保留每一份重要内容。';
   const elevate = async () => {
     const result = await post('/api/privileges/elevate', {});
-    if (!result.launched) throw new Error(result.message || '未能启动管理员会话。');
+    if (result.already_elevated) {
+      setPrivileges(current => ({ ...current, elevated: true, can_request: false,
+        reason: 'elevated', display: result.message || '当前会话已具有管理员权限。' }));
+    }
+    if (!result.launched && !result.cancelled && !result.already_elevated) {
+      throw new Error(result.message || 'Windows 未确认新的管理员会话启动请求。');
+    }
     return result;
   };
 

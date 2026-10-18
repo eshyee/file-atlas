@@ -195,6 +195,11 @@ def test_normal_startup_never_requests_elevation(monkeypatch, tmp_path, capsys):
     fake = SimpleNamespace(server_port=12345,
                            app=SimpleNamespace(token='test-session', stop_workers=Mock()),
                            serve_forever=Mock(side_effect=KeyboardInterrupt), server_close=Mock())
+    # This launcher test must work in a clean checkout before the UI is built.
+    static = tmp_path / 'frontend' / 'dist'
+    static.mkdir(parents=True)
+    (static / 'index.html').write_text('<title>File Atlas test</title>', encoding='utf-8')
+    monkeypatch.setattr(sys, '_MEIPASS', str(tmp_path), raising=False)
     monkeypatch.setattr(server, 'create_server', Mock(return_value=fake))
     monkeypatch.setattr(sys, 'argv', ['fileatlas', '--no-browser', '--data-dir', str(tmp_path)])
     monkeypatch.setattr(privileges, 'get_privilege_status', lambda: status())
@@ -210,7 +215,7 @@ def test_packaged_manifest_preserves_as_invoker_policy():
     root = ElementTree.parse(Path(__file__).resolve().parents[1] / 'scripts' / 'fileatlas.manifest')
     identity = root.find('.//{urn:schemas-microsoft-com:asm.v1}assemblyIdentity')
     level = root.find('.//{urn:schemas-microsoft-com:asm.v3}requestedExecutionLevel')
-    assert identity.attrib['version'] == '1.1.0.0'
+    assert identity.attrib['version'] == '1.1.1.0'
     assert level.attrib == {'level': 'asInvoker', 'uiAccess': 'false'}
 
 

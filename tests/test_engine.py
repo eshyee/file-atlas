@@ -1,7 +1,9 @@
 """Safety regressions use disposable files, never a user's real documents."""
 
 import json
+import errno
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -686,6 +688,163 @@ class EngineSafetyTests(unittest.TestCase):
         self.assertEqual('document', plan['items'][0]['category'])
         self.assertTrue(archive.exists())
         self.assertIn('document_classify', plan['items'][0]['destination'])
+
+    @staticmethod
+    def denied(winerror):
+        error = PermissionError(errno.EACCES, 'simulated native access failure')
+        error.winerror = winerror
+        return error
+
+    def test_target_creation_denied_reports_destination_and_keeps_original(self):
+        original = self.file()
+        before = original.read_bytes()
+        plan = self.scan(operation='move')
+        target = Path(plan['items'][0]['destination'])
+        native_open = os.open
+
+        def cannot_create_stage(path, flags, *args, **kwargs):
+            if str(path).endswith('.tmp') and '.fileatlas-' in Path(path).name:
+                raise self.denied(5)
+            return native_open(path, flags, *args, **kwargs)
+
+        with patch('fileatlas.engine.os.open', side_effect=cannot_create_stage):
+            result = self.engine.execute(plan['id'])
+        error = result['errors'][0]
+        self.assertEqual('partial', result['status'])
+        self.assertEqual(('access_denied', 'create_temp', 5), (error['code'], error['phase'], error['winerror']))
+        self.assertEqual(str(original), error['path'])
+        self.assertEqual(str(original), error['source'])
+        self.assertEqual(str(target), error['destination'])
+        self.assertIn('目标位置', error['error'])
+        self.assertEqual(before, original.read_bytes())
+        self.assertFalse(target.exists())
+        self.assertEqual('restored', self.engine.restore(result['id'])['status'])
+
+    def test_disk_full_mid_copy_preserves_original_and_recovers_partial_stage(self):
+        original = self.file(contents=b'original data' * 200_000)
+        before = original.read_bytes()
+        plan = self.scan(operation='move')
+        native_fdopen = os.fdopen
+
+        class FullOutput:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def write(self, block):
+                self.stream.write(block[:4096])
+                self.stream.flush()
+                raise OSError(errno.ENOSPC, 'disk full during write')
+
+        def no_space(descriptor, mode, **kwargs):
+            stream = native_fdopen(descriptor, mode, **kwargs)
+            return FullOutput(stream) if mode == 'wb' else stream
+
+        with patch('fileatlas.engine.os.fdopen', side_effect=no_space):
+            result = self.engine.execute(plan['id'])
+        error = result['errors'][0]
+        self.assertEqual(('disk_full', 'copy'), (error['code'], error['phase']))
+        self.assertIn('空间不足', error['error'])
+        self.assertEqual(before, original.read_bytes())
+        self.assertFalse(Path(plan['items'][0]['destination']).exists())
+        self.assertEqual(1, len(list(self.destination.rglob('*.tmp'))))
+        self.assertEqual('restored', self.engine.restore(result['id'])['status'])
+        self.assertEqual([], list(self.destination.rglob('*.tmp')))
+
+    def test_delete_denied_after_verified_copy_reports_both_retained(self):
+        original = self.file()
+        before = original.read_bytes()
+        plan = self.scan(operation='move')
+        target = Path(plan['items'][0]['destination'])
+        native_unlink = Path.unlink
+
+        def deny_original_unlink(path, *args, **kwargs):
+            if path == original:
+                raise self.denied(5)
+            return native_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, 'unlink', new=deny_original_unlink):
+            result = self.engine.execute(plan['id'])
+        error = result['errors'][0]
+        self.assertEqual(('access_denied', 'remove_source', 5), (error['code'], error['phase'], error['winerror']))
+        self.assertIn('完整复制并验证', error['error'])
+        self.assertIn('原文件和目标副本均已保留', error['error'])
+        self.assertEqual(before, original.read_bytes())
+        self.assertEqual(before, target.read_bytes())
+        self.assertEqual('restored', self.engine.restore(result['id'])['status'])
+        self.assertTrue(original.exists())
+        self.assertFalse(target.exists())
+
+    def test_exclusive_source_lock_is_distinguished_from_permissions(self):
+        original = self.file()
+        for winerror, code in ((32, 'sharing_violation'), (33, 'file_locked')):
+            with self.subTest(winerror=winerror):
+                plan = self.scan(operation='move')
+                with patch('fileatlas.engine._open_read', side_effect=self.denied(winerror)):
+                    result = self.engine.execute(plan['id'])
+                error = result['errors'][0]
+                self.assertEqual((code, 'verify_source', winerror), (error['code'], error['phase'], error['winerror']))
+                self.assertTrue('占用' in error['error'] or '锁定' in error['error'])
+                self.assertNotIn('管理员', error['error'])
+                self.assertTrue(original.exists())
+                self.assertFalse(Path(plan['items'][0]['destination']).exists())
+
+    def test_restore_write_denied_keeps_surviving_copy_and_can_retry(self):
+        original, target, result = self.execute_one('move')
+        native_open = os.open
+
+        def cannot_create_original_stage(path, flags, *args, **kwargs):
+            if Path(path).parent == original.parent and str(path).endswith('.tmp'):
+                raise self.denied(5)
+            return native_open(path, flags, *args, **kwargs)
+
+        with patch('fileatlas.engine.os.open', side_effect=cannot_create_original_stage):
+            restored = self.engine.restore(result['id'])
+        error = restored['errors'][0]
+        self.assertEqual(('access_denied', 'create_temp'), (error['code'], error['phase']))
+        self.assertIn('原位置', error['error'])
+        self.assertEqual(str(original), error['source'])
+        self.assertEqual(str(target), error['destination'])
+        self.assertFalse(original.exists())
+        self.assertEqual(b'important original data', target.read_bytes())
+        self.assertEqual('restored', self.engine.restore(result['id'])['status'])
+        self.assertEqual(b'important original data', original.read_bytes())
+
+    @unittest.skipUnless(os.name == 'nt', 'Real Windows read-only attribute behavior')
+    def test_read_only_source_and_undo_copy_are_explained_without_clearing_flags(self):
+        original = self.file()
+        original.chmod(stat.S_IREAD)
+        plan = self.scan(operation='move')
+        target = Path(plan['items'][0]['destination'])
+
+        def cleanup_fixture_attributes():
+            for path in (original, target):
+                if path.exists():
+                    path.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+        self.addCleanup(cleanup_fixture_attributes)
+        result = self.engine.execute(plan['id'])
+        error = result['errors'][0]
+        self.assertEqual(('read_only', 'remove_source', 5), (error['code'], error['phase'], error['winerror']))
+        self.assertIn('均已保留', error['error'])
+        self.assertTrue(original.stat().st_file_attributes & 1)
+        self.assertTrue(target.stat().st_file_attributes & 1)
+        self.assertEqual(original.read_bytes(), target.read_bytes())
+        restored = self.engine.restore(result['id'])
+        error = restored['errors'][0]
+        self.assertEqual(('read_only', 'remove_destination', 5), (error['code'], error['phase'], error['winerror']))
+        self.assertIn('两处文件均已保留', error['error'])
+        self.assertTrue(original.stat().st_file_attributes & 1)
+        self.assertTrue(target.stat().st_file_attributes & 1)
 
 
 if __name__ == '__main__':

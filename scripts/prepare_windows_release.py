@@ -93,15 +93,22 @@ def _package_licenses(distribution: str, destination: Path):
     return {'name': distribution, 'version': installed.version, 'license_files': count}
 
 
+def _tk_license_path(workspace: Path):
+    installed = sorted((Path(sys.base_prefix) / 'tcl').glob('tk*/license.terms'))
+    if installed:
+        return installed[-1]
+    # GitHub Actions' Python distribution omits this text while bundling Tk.
+    fallback = workspace / 'scripts' / 'licenses' / 'Tk8.6-LICENSE.txt'
+    if not fallback.is_file():
+        raise FileNotFoundError('Neither the installed nor the bundled Tk 8.6 license is available.')
+    return fallback
+
+
 def collect_licenses(workspace: Path, stage: Path, modules, include_models: bool):
     licenses = stage / 'licenses'
     _copy(Path(sys.base_prefix) / 'LICENSE.txt', licenses / 'Python' / 'LICENSE.txt')
     _copy(workspace / 'scripts' / 'licenses' / 'Tcl8.6-LICENSE.txt', licenses / 'Tcl' / 'LICENSE.txt')
-    tcl_root = Path(sys.base_prefix) / 'tcl'
-    tk_licenses = sorted(tcl_root.glob('tk*/license.terms'))
-    if not tk_licenses:
-        raise ValueError('The Python installation is missing the Tk runtime license.')
-    _copy(tk_licenses[-1], licenses / 'Tk' / 'license.terms')
+    _copy(_tk_license_path(workspace), licenses / 'Tk' / 'license.terms')
     packages = ['Pillow', 'pyinstaller']
     packages += ['numpy'] if 'numpy' in modules else []
     packages += ['opencv-python-headless'] if 'cv2' in modules else []

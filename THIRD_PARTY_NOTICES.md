@@ -34,7 +34,7 @@ The Windows packaging script downloads the model and the exact upstream license 
 - Lucide React — ISC License, with included icon attribution notices
 - [FFmpeg](https://ffmpeg.org/) when supplied by the user — its build's applicable LGPL/GPL terms
 
-The Windows release ZIP includes a `licenses/` directory containing the actual installed runtime license texts, both model licenses, and the frontend runtime notices. `licenses/runtime-manifest.json` records the application, Python and package versions used for that build. The Tcl 8.6 license copy comes from the upstream [core-8-6-15 license](https://github.com/tcltk/tcl/blob/core-8-6-15/license.terms); Tk's license is copied from the Python installation used to build the native folder picker.
+The Windows release ZIP includes a `licenses/` directory containing the actual installed runtime license texts, both model licenses, and the frontend runtime notices. `licenses/runtime-manifest.json` records the application, Python and package versions used for that build. The Tcl 8.6 license copy comes from the upstream [core-8-6-15 license](https://github.com/tcltk/tcl/blob/core-8-6-15/license.terms). Tk's license is copied from the Python installation used to build the native folder picker; distributions that omit that file use the bundled upstream [Tk 8.6 license](https://github.com/tcltk/tk/blob/core-8-6-15/license.terms).
 
 The application never downloads these runtime libraries while it is running. FFmpeg and ExifTool are not bundled. Review the included license texts for the terms applying to each component.
 

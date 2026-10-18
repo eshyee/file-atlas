@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
-from .engine import Engine, _open_read, _path_guard, _snapshot, _within
+from .engine import Engine, format_file_error, _open_read, _path_guard, _snapshot, _within
 from .faces import FaceIndex
 from .privileges import get_privilege_status, relaunch_elevated
 
@@ -133,8 +133,10 @@ class Application:
             return Path(name), os.fdopen(descriptor, 'w+b')
 
     def _run_preview_tool(self, command, source, snapshot, *, output=None, timeout=15):
-        # Standard input is an already-authorized read handle. No filesystem
-        # input path is passed to a decoder, and nested input protocols are off.
+        # Standard input is an already-authorized read handle. The fd protocol
+        # preserves seeking on this regular file (camera MP4 indexes may be at
+        # the end); pipe:0 would silently lose frames. No source path is given
+        # to the decoder, and file/network protocols remain disabled.
         with _open_read(source, snapshot) as stream:
             with self.preview_lock:
                 if self.preview_stopping.is_set():
@@ -173,9 +175,9 @@ class Application:
         if not probe:
             return False
         command = [probe, '-v', 'fatal', '-max_alloc', '268435456',
-                   '-protocol_whitelist', 'pipe', '-f', PREVIEW_DEMUXERS[source.suffix.lower()],
+                   '-protocol_whitelist', 'fd,pipe', '-f', PREVIEW_DEMUXERS[source.suffix.lower()],
                    '-probesize', '5000000', '-analyzeduration', '3000000',
-                   '-show_entries', 'stream=codec_name,codec_type', '-of', 'json', '-i', 'pipe:0']
+                   '-show_entries', 'stream=codec_name,codec_type', '-of', 'json', '-fd', '0', '-i', 'fd:']
         try:
             result = self._run_preview_tool(command, source, snapshot, timeout=8)
             if result.returncode or len(result.stdout) > 1024 * 1024:
@@ -229,20 +231,21 @@ class Application:
             raise PreviewError('此格式需要本机 FFmpeg 或相应图片解码支持，请安装后重试。', 415)
         target, output = self._preview_file('.mp4' if video else '.jpg')
         command = [executable, '-hide_banner', '-loglevel', 'fatal', '-nostdin',
-                   '-max_alloc', '268435456', '-threads', '1',
-                   '-protocol_whitelist', 'pipe', '-probesize', '5000000',
+                   '-max_alloc', '268435456', '-threads', '4',
+                   '-protocol_whitelist', 'fd,pipe', '-probesize', '5000000',
                    '-analyzeduration', '3000000']
         if video:
             command += ['-f', PREVIEW_DEMUXERS[source.suffix.lower()]]
         else:
             # image2pipe accepts one image and cannot expand names or open siblings.
             command += ['-f', 'image2pipe']
-        command += ['-i', 'pipe:0', '-map', '0:v:0']
+        command += ['-fd', '0', '-i', 'fd:', '-map', '0:v:0']
         if video:
-            command += ['-map', '0:a:0?', '-t', str(PREVIEW_VIDEO_SECONDS),
+            command += ['-abort_on', 'empty_output+empty_output_stream',
+                        '-map', '0:a:0?', '-t', str(PREVIEW_VIDEO_SECONDS),
                         '-vf', "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
                         '-r', '30', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26',
-                        '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-threads', '1',
+                        '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-threads', '2',
                         '-movflags', 'frag_keyframe+empty_moov', '-f', 'mp4']
         else:
             command += ['-frames:v', '1', '-vf', "scale=w='min(1600,iw)':h='min(1600,ih)':force_original_aspect_ratio=decrease",
@@ -250,7 +253,7 @@ class Application:
         command += ['-fs', str(PREVIEW_MAX_BYTES), 'pipe:1']
         try:
             with output:
-                result = self._run_preview_tool(command, source, snapshot, output=output, timeout=45 if video else 15)
+                result = self._run_preview_tool(command, source, snapshot, output=output, timeout=90 if video else 15)
             if result.returncode or target.stat().st_size == 0 or target.stat().st_size > PREVIEW_MAX_BYTES:
                 raise PreviewError('本机解码器无法生成此文件的预览，原文件保持不变。', 415)
             return target
@@ -266,7 +269,10 @@ class Application:
             if _snapshot(os.fstat(original.fileno())) != snapshot:
                 raise PreviewError('原文件发生变化，请重新扫描。', 409)
         best, best_area, offset = None, 0, 0
-        for _ in range(8):
+        # Maker notes may contain false SOI patterns before the actual previews.
+        # Bound candidate attempts as well as bytes/pixels, while allowing those
+        # normal camera files to reach their later embedded JPEGs.
+        for _ in range(64):
             offset = data.find(b'\xff\xd8\xff', offset)
             if offset < 0:
                 break
@@ -473,7 +479,10 @@ class Application:
                     raise ValueError('不支持的任务类型。')
                 job['status'] = 'cancelled' if job['cancel'].is_set() else 'completed'
             except Exception as exc:
-                job['error'] = str(exc)
+                phase = 'scan' if action in ('scan', 'faces') else action
+                error_info = format_file_error(exc, phase=phase, source=getattr(exc, 'filename', None))
+                job['error_info'] = error_info
+                job['error'] = error_info['error']
                 job['status'] = 'cancelled' if job['cancel'].is_set() else 'failed'
                 traceback.print_exc()
             finally:
@@ -499,10 +508,10 @@ class Application:
         arguments = ['--data-dir', str(self.engine.data_dir)]
         if self.desktop:
             arguments.append('--desktop')
-        result = relaunch_elevated(arguments)
-        if result.get('launched') and self.server is not None:
-            threading.Timer(1.5, self.server.shutdown).start()
-        return result
+        # ShellExecuteEx confirms the launch request, not that the new UI has
+        # finished starting. Keep this session available if startup fails, and
+        # never leave its browser tab talking to a deliberately stopped server.
+        return relaunch_elevated(arguments)
 
     def job_snapshot(self, job_id):
         job = self.jobs[job_id]

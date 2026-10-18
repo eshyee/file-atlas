@@ -9,6 +9,7 @@ copy.  Paths, identity, timestamps and content are rechecked during execution.
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import re
@@ -57,6 +58,89 @@ class SafetyError(ValueError):
 
 class JournalError(RuntimeError):
     """A journal durability failure must stop the entire mutation immediately."""
+
+
+class _OperationFailure(ValueError):
+    """Keep the native error while identifying the precise copy step that failed."""
+
+    def __init__(self, cause, phase):
+        super().__init__(str(cause))
+        self.cause, self.phase = cause, phase
+
+
+def format_file_error(exc, *, phase='operation', source=None, destination=None,
+                      operation=None, verified_copy=False):
+    """Build compatible, structured diagnostics without changing any permission.
+
+    ``source``/``destination`` always refer to the original plan, including undo.
+    The helper also accepts ordinary OS errors from API boundaries.
+    """
+    if isinstance(exc, _OperationFailure):
+        phase, exc = exc.phase, exc.cause
+    source = os.fspath(source) if source is not None else ''
+    destination = os.fspath(destination) if destination is not None else ''
+    winerror, error_number = getattr(exc, 'winerror', None), getattr(exc, 'errno', None)
+    writing = {'create_destination', 'create_temp', 'copy', 'preserve_metadata', 'publish_destination'}
+    affected = source if phase == 'remove_source' else destination
+    if phase in writing and operation == 'restore':
+        affected = source
+    read_only = False
+    if affected and (phase in writing or phase in ('remove_source', 'remove_destination')):
+        try:
+            info = Path(affected).lstat()
+            read_only = stat.S_ISREG(info.st_mode) and bool(getattr(info, 'st_file_attributes', 0) & 1)
+        except OSError:
+            pass
+    if winerror == 32:
+        code, reason = 'sharing_violation', '文件正被其他程序占用，请关闭正在使用它的程序后重试。'
+    elif winerror == 33:
+        code, reason = 'file_locked', '文件的部分区域被其他程序锁定，请等待写入结束后重试。'
+    elif winerror == 19 or error_number == errno.EROFS:
+        code, reason = 'write_protected', '目标磁盘或文件系统受到写保护，请选择可写位置；归序没有修改写保护设置。'
+    elif (winerror == 5 or error_number in (errno.EACCES, errno.EPERM) or isinstance(exc, PermissionError)) and read_only:
+        code, reason = 'read_only', '文件带有只读属性，归序没有清除该属性或修改访问权限。'
+    elif winerror == 5 or error_number in (errno.EACCES, errno.EPERM) or isinstance(exc, PermissionError):
+        code, reason = 'access_denied', 'Windows 或文件系统拒绝访问，请检查相应位置的读写/删除权限，或选择可写文件夹。'
+    elif winerror in (39, 112) or error_number == errno.ENOSPC:
+        code, reason = 'disk_full', '目标磁盘可用空间不足，原文件没有因此被删除。'
+    elif isinstance(exc, FileExistsError) or winerror in (80, 183) or error_number == errno.EEXIST:
+        code, reason = 'destination_exists', '目标已被其他文件占用，归序没有覆盖它。'
+    elif isinstance(exc, FileNotFoundError) or winerror in (2, 3) or error_number == errno.ENOENT:
+        code, reason = 'not_found', '文件或文件夹已不存在，请重新扫描。'
+    elif isinstance(exc, JournalError):
+        code, reason = 'journal_error', str(exc)
+    elif isinstance(exc, SafetyError):
+        code, reason = 'safety_check', str(exc)
+    else:
+        code, reason = 'io_error' if isinstance(exc, OSError) else 'invalid_operation', str(exc)
+    labels = {
+        'scan': '扫描文件夹', 'pick_folder': '打开文件夹选择器',
+        'validate_paths': '检查来源与目标路径', 'verify_source': '读取或验证原文件',
+        'verify_keeper': '验证保留副本', 'open_source': '读取复制来源',
+        'read_source': '读取复制来源的内容', 'verify_copy_source': '核验复制来源',
+        'create_destination': '创建目标文件夹', 'create_temp': '在目标位置创建暂存文件',
+        'copy': '写入目标副本', 'preserve_metadata': '保留副本的时间与属性',
+        'verify_copy': '核验副本内容', 'publish_destination': '发布目标副本',
+        'verify_destination': '核验目标副本', 'remove_source': '移除原位置文件',
+        'remove_destination': '移除已恢复的目标副本', 'cleanup_stage': '清理暂存文件',
+        'sync_source_directory': '保存原位置的文件夹变更',
+        'sync_destination_directory': '保存目标文件夹变更',
+    }
+    label = labels.get(phase, '处理文件')
+    if operation == 'restore' and phase in writing:
+        label = {'create_destination': '创建恢复文件夹', 'create_temp': '在原位置创建恢复暂存文件',
+                 'copy': '写入原位置的恢复副本', 'publish_destination': '发布原位置的恢复副本'}.get(phase, label)
+    both_retained = bool(verified_copy and source and destination and _exists(source) and _exists(destination))
+    if phase == 'remove_source' and both_retained:
+        message = '文件已完整复制并验证，但原位置未能移除。原文件和目标副本均已保留。' + reason
+    elif phase == 'remove_destination' and both_retained:
+        message = '原位置的文件已验证，但目标副本未能移除。两处文件均已保留。' + reason
+    else:
+        message = f'{label}失败：{reason}'
+    if winerror is not None:
+        message += f'（Windows 错误 {winerror}）'
+    return {'path': source or destination, 'error': message, 'code': code, 'phase': phase,
+            'source': source, 'destination': destination, 'winerror': winerror}
 
 
 def _now():
@@ -667,18 +751,25 @@ class Engine:
     def _publish_copy(self, source, destination, expected, digest, journal, item_id, cancel, *, restoring=False):
         """Exclusive staging + readback verification + atomic no-overwrite publish."""
         _check_cancel(cancel)
-        _path_guard(source)
-        _path_guard(destination)
-        if _exists(destination):
-            raise SafetyError(f'目标已存在，绝不覆盖：{destination}')
-        _safe_mkdir(destination.parent)
+        phase = 'validate_paths'
+        try:
+            _path_guard(source)
+            _path_guard(destination)
+            if _exists(destination):
+                raise SafetyError(f'目标已存在，绝不覆盖：{destination}')
+            phase = 'create_destination'
+            _safe_mkdir(destination.parent)
+        except (OSError, ValueError) as exc:
+            raise _OperationFailure(exc, phase) from exc
         temp = destination.with_name(f'.{destination.name}.fileatlas-{uuid.uuid4().hex}.tmp')
         event_prefix = 'restore_' if restoring else ''
         self._append(journal, event_prefix + 'stage_intent', item_id=item_id, temp=str(temp))
         created_snapshot = None
+        phase = 'open_source'
         try:
             with _open_read(source, expected) as original:
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+                phase = 'create_temp'
                 descriptor = os.open(temp, flags, 0o600)
                 with os.fdopen(descriptor, 'wb') as output:
                     self._append(journal, event_prefix + 'stage_created', item_id=item_id,
@@ -686,27 +777,34 @@ class Engine:
                     copied = hashlib.sha256()
                     while True:
                         _check_cancel(cancel)
+                        phase = 'read_source'
                         block = original.read(CHUNK_SIZE)
                         if not block:
                             break
+                        phase = 'copy'
                         output.write(block)
                         copied.update(block)
+                    phase = 'copy'
                     output.flush()
                     os.fsync(output.fileno())
                     created_snapshot = _snapshot(os.fstat(output.fileno()))
                 if not _matches(os.fstat(original.fileno()), expected) or copied.hexdigest() != digest:
                     raise SafetyError(f'复制时来源内容发生变化，来源已保留：{source}')
+            phase = 'verify_copy_source'
             _file_info(source, expected)
             # Windows fsync requires a writable handle. Open it before copystat
             # might apply the source's read-only attribute, then flush metadata.
+            phase = 'preserve_metadata'
             with temp.open('r+b') as staged:
                 shutil.copystat(source, temp, follow_symlinks=False)
                 _preserve_creation_time(source, temp)
                 created_snapshot = _snapshot(_file_info(temp))
+                phase = 'verify_copy'
                 _verify(temp, created_snapshot, digest, cancel)
                 os.fsync(staged.fileno())
             self._append(journal, event_prefix + 'copy_ready', item_id=item_id, temp=str(temp), snapshot=created_snapshot)
             _check_cancel(cancel)
+            phase = 'publish_destination'
             _path_guard(destination)
             _file_info(temp, created_snapshot)
             if _exists(destination):
@@ -716,10 +814,13 @@ class Engine:
             published_snapshot = _snapshot(_file_info(destination, created_snapshot))
             self._append(journal, event_prefix + 'published', item_id=item_id, snapshot=published_snapshot)
             if _exists(temp):
+                phase = 'cleanup_stage'
                 _file_info(temp, created_snapshot)
                 temp.unlink()
                 _sync_directory(temp.parent)
             return published_snapshot
+        except (OSError, ValueError) as exc:
+            raise _OperationFailure(exc, phase) from exc
         finally:
             # Remove only our own still-identical staging inode.  A crashed process
             # leaves its stage in place, and recovery can identify it from the log.
@@ -766,6 +867,7 @@ class Engine:
             completed, errors, was_cancelled = 0, [], False
             for index, item in enumerate(items):
                 source, destination = Path(item['source']), Path(item['destination'])
+                phase, verified_copy = 'verify_source', False
                 try:
                     _check_cancel(cancel)
                     _progress(progress, phase='execute', processed=index, total=len(items), path=str(source), message='正在验证并安全处理文件')
@@ -773,6 +875,7 @@ class Engine:
                     digest = item.get('sha256') or _hash_file(source, expected, cancel)
                     _verify(source, expected, digest, cancel)
                     if item['action'] == 'quarantine':
+                        phase = 'verify_keeper'
                         keeper = Path(item['keeper'])
                         keeper_expected = snapshots[str(keeper)]
                         _verify(keeper, keeper_expected, digest, cancel)
@@ -781,24 +884,34 @@ class Engine:
                     self._append(journal, 'prepared', item_id=item['id'], source=str(source), destination=str(destination),
                                  action=item['action'], size=item['size'], sha256=digest, source_snapshot=expected,
                                  keeper=item.get('keeper'), keeper_snapshot=snapshots.get(item.get('keeper')))
+                    phase = 'copy'
                     published = self._publish_copy(source, destination, expected, digest, journal, item['id'], cancel)
+                    verified_copy = True
                     if item['action'] == 'quarantine':
                         self._hide_quarantine(destination)
                     if item['action'] != 'copy':
                         _check_cancel(cancel)
+                        phase = 'verify_destination'
                         _verify(destination, published, digest, cancel)
+                        phase = 'verify_source'
                         _verify(source, expected, digest, cancel)
                         if item['action'] == 'quarantine':
+                            phase = 'verify_keeper'
                             _verify(keeper, keeper_expected, digest, cancel)
                             if not _identical(source, keeper, expected, keeper_expected, cancel):
                                 raise SafetyError('保留副本发生变化，原文件和隔离副本均已保留。')
                         self._append(journal, 'remove_intent', item_id=item['id'])
                         _check_cancel(cancel)
+                        phase = 'verify_source'
                         _file_info(source, expected)
+                        phase = 'verify_destination'
                         _file_info(destination, published)
                         if item['action'] == 'quarantine':
+                            phase = 'verify_keeper'
                             _file_info(keeper, keeper_expected)
+                        phase = 'remove_source'
                         source.unlink()
+                        phase = 'sync_source_directory'
                         _sync_directory(source.parent)
                     self._append(journal, 'committed', item_id=item['id'])
                     completed += 1
@@ -806,7 +919,8 @@ class Engine:
                     was_cancelled = True
                     break
                 except (OSError, ValueError) as exc:
-                    error = {'path': str(source), 'error': str(exc)}
+                    error = format_file_error(exc, phase=phase, source=source, destination=destination,
+                                              operation=item['action'], verified_copy=verified_copy)
                     errors.append(error)
                     self._append(journal, 'item_failed', item_id=item['id'], **error)
             status = 'cancelled' if was_cancelled else 'partial' if errors else 'completed'
@@ -896,6 +1010,7 @@ class Engine:
                 entry = state['prepared']
                 source, destination = Path(entry['source']), Path(entry['destination'])
                 digest, original_snapshot = entry['sha256'], entry['source_snapshot']
+                phase, verified_copy = 'validate_paths', False
                 try:
                     _check_cancel(cancel)
                     _progress(progress, phase='restore', processed=index, total=len(pending), path=str(source), message='正在核对并恢复原位置')
@@ -906,9 +1021,11 @@ class Engine:
                         # A crash may precede publication or follow removal during restore.
                         restored_source = state.get('restore_published') or state.get('restore_copy_ready')
                         expected_source = restored_source['snapshot'] if restored_source else original_snapshot
+                        phase = 'verify_source'
                         _verify(source, expected_source, digest, cancel)
                         if 'committed' in state and not restored_source and entry['action'] != 'copy':
                             raise SafetyError('隔离/目标副本缺失，无法确认恢复来源，已停止。')
+                        phase = 'cleanup_stage'
                         self._clean_stage(state, journal, item_id, digest, reference=source,
                                           reference_snapshot=expected_source, cancel=cancel)
                         self._clean_stage(state, journal, item_id, digest, restoring=True, reference=source,
@@ -918,7 +1035,9 @@ class Engine:
                     if not published:
                         raise SafetyError('目标缺少可验证的发布记录，已保留并停止自动恢复。')
                     destination_snapshot = published['snapshot']
+                    phase = 'verify_destination'
                     _verify(destination, destination_snapshot, digest, cancel)
+                    phase = 'cleanup_stage'
                     self._clean_stage(state, journal, item_id, digest, reference=destination,
                                       reference_snapshot=destination_snapshot, cancel=cancel)
                     self._clean_stage(state, journal, item_id, digest, restoring=True, reference=destination,
@@ -926,21 +1045,32 @@ class Engine:
                     if _exists(source):
                         restored_source = state.get('restore_published') or state.get('restore_copy_ready')
                         expected_source = restored_source['snapshot'] if restored_source else original_snapshot
+                        phase = 'verify_source'
                         _verify(source, expected_source, digest, cancel)
                     else:
+                        phase = 'verify_source'
                         if entry['action'] == 'copy':
                             raise SafetyError('原文件已不存在，目标副本已保留，防止丢失唯一副本。')
                         self._append(journal, 'restore_intent', item_id=item_id)
+                        phase = 'copy'
                         expected_source = self._publish_copy(destination, source, destination_snapshot, digest,
                                                              journal, item_id, cancel, restoring=True)
+                    phase = 'verify_source'
                     _verify(source, expected_source, digest, cancel)
+                    phase = 'verify_destination'
                     _verify(destination, destination_snapshot, digest, cancel)
+                    verified_copy = True
                     self._append(journal, 'restore_remove_intent', item_id=item_id)
                     _check_cancel(cancel)
+                    phase = 'verify_source'
                     _file_info(source, expected_source)
+                    phase = 'verify_destination'
                     _file_info(destination, destination_snapshot)
+                    phase = 'remove_destination'
                     destination.unlink()
+                    phase = 'sync_destination_directory'
                     _sync_directory(destination.parent)
+                    phase = 'cleanup_stage'
                     self._clean_stage(state, journal, item_id, digest)
                     self._clean_stage(state, journal, item_id, digest, restoring=True)
                     self._append(journal, 'restored', item_id=item_id)
@@ -948,7 +1078,8 @@ class Engine:
                     was_cancelled = True
                     break
                 except (OSError, ValueError) as exc:
-                    error = {'path': str(source), 'error': str(exc)}
+                    error = format_file_error(exc, phase=phase, source=source, destination=destination,
+                                              operation='restore', verified_copy=verified_copy)
                     errors.append(error)
                     self._append(journal, 'restore_failed', item_id=item_id, **error)
             status = 'restore_cancelled' if was_cancelled else 'restore_partial' if errors else 'restored'

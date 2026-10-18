@@ -44,6 +44,25 @@ def test_api_requires_token(local_app):
         assert json.load(response)['local_only'] is True
 
 
+def test_elevation_keeps_original_session_available(local_app, monkeypatch):
+    """A submitted UAC launch must not disconnect an otherwise usable page."""
+    import time
+    from fileatlas import server as module
+
+    monkeypatch.setattr(module, 'get_privilege_status', lambda: {
+        'elevated': False, 'can_request': True, 'platform': 'windows'})
+    calls = []
+    monkeypatch.setattr(module, 'relaunch_elevated', lambda arguments: (
+        calls.append(arguments) or {'launched': True, 'cancelled': False, 'pid': 123}))
+    with request(local_app, '/api/privileges/elevate', {}) as response:
+        assert json.load(response)['launched'] is True
+    assert calls == [['--data-dir', str(local_app.app.engine.data_dir)]]
+    # Previously a 1.5-second timer shut down this server, leaving a stale tab.
+    time.sleep(1.7)
+    with request(local_app, '/api/config') as response:
+        assert json.load(response)['local_only'] is True
+
+
 @pytest.mark.parametrize('headers', [
     {'Origin': 'https://evil.example'},
     {'Origin': 'null'},

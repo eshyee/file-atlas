@@ -197,17 +197,51 @@ def _decode(data, suffix, max_dim, max_pixels):
 class OpenCVBackend:
     """CPU-only local detector/recognizer; no package/model download paths exist."""
 
+    @staticmethod
+    def _model_bytes(path, expected=None):
+        """Read a verified model in Python, whose file APIs handle Unicode paths."""
+        path = _path_guard(_absolute(path), projects=False)
+        info = path.lstat()
+        if _linked(info) or not stat.S_ISREG(info.st_mode) or not 1024 <= info.st_size <= 512 * 1024 * 1024:
+            raise SafetyError('模型必须为本地普通 ONNX 文件（1 KiB 至 512 MiB）。')
+        snapshot = _snapshot(info)
+        if expected is not None and snapshot != {key: expected[key] for key in snapshot}:
+            raise SafetyError('模型加载前发生变化，请重新建立索引。')
+        with path.open('rb') as stream:
+            if not _matches(os.fstat(stream.fileno()), snapshot):
+                raise SafetyError('模型打开时发生变化，请重新建立索引。')
+            data = stream.read(512 * 1024 * 1024 + 1)
+            if len(data) != snapshot['size'] or not _matches(os.fstat(stream.fileno()), snapshot):
+                raise SafetyError('模型读取时发生变化，请重新建立索引。')
+        _path_guard(path, projects=False)
+        if not _matches(path.lstat(), snapshot):
+            raise SafetyError('模型读取完成后发生变化，请重新建立索引。')
+        if expected is not None and hashlib.sha256(data).hexdigest() != expected['sha256']:
+            raise SafetyError('模型内容在指纹校验后发生变化，请重新建立索引。')
+        return data
+
     def __init__(self, detector, recognizer, config):
         import cv2
         import numpy
         self.cv2, self.numpy = cv2, numpy
         self.min_score = config['min_score']
         self.min_face = config['min_face']
-        self.detector = cv2.FaceDetectorYN.create(str(detector), '', (320, 320),
-                                                self.min_score, 0.3, 5000,
-                                                cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU)
-        self.recognizer = cv2.FaceRecognizerSF.create(str(recognizer), '',
-                                                    cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU)
+        expected = {Path(model['path']).name: model for model in config.get('models', [])}
+        detector_bytes = self._model_bytes(detector, expected.get(Path(detector).name))
+        recognizer_bytes = self._model_bytes(recognizer, expected.get(Path(recognizer).name))
+        empty_config = numpy.empty(0, dtype=numpy.uint8)
+        try:
+            # OpenCV's Windows filename overload cannot reliably open Unicode
+            # model paths. Buffers also ensure inference uses the hashed bytes.
+            self.detector = cv2.FaceDetectorYN.create(
+                'onnx', numpy.frombuffer(detector_bytes, dtype=numpy.uint8), empty_config,
+                (320, 320), self.min_score, 0.3, 5000,
+                cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU)
+            self.recognizer = cv2.FaceRecognizerSF.create(
+                'onnx', numpy.frombuffer(recognizer_bytes, dtype=numpy.uint8), empty_config,
+                cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU)
+        except cv2.error as exc:
+            raise SafetyError('本地人脸模型无法加载，请检查完整 ONNX 模型和 OpenCV 版本。') from exc
 
     def analyze(self, image):
         cv2, np = self.cv2, self.numpy
@@ -312,8 +346,12 @@ class FaceIndex:
             try:
                 loaded = importlib.import_module(module)
                 available, error = True, ''
-                if module == 'cv2' and not all(hasattr(loaded, name) for name in ('FaceDetectorYN', 'FaceRecognizerSF')):
-                    available, error = False, '当前 OpenCV 不包含 YuNet/SFace 接口，请安装 OpenCV 4.10 或更新的 4.x 版本。'
+                if module == 'cv2' and not all(
+                    hasattr(loaded, name) and
+                    'bufferModel' in (getattr(loaded, name).create.__doc__ or '')
+                    for name in ('FaceDetectorYN', 'FaceRecognizerSF')
+                ):
+                    available, error = False, '当前 OpenCV 不包含 YuNet/SFace 内存模型接口，请安装 OpenCV 4.11 或更新的 4.x 版本。'
                 dependencies[module] = {'available': available, 'package': package,
                                         'version': getattr(loaded, '__version__', ''), 'error': error}
             except Exception as exc:

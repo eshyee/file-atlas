@@ -9,7 +9,7 @@ function Get-VerifiedFile {
     $partial = "$Destination.download"
     Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $partial
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $partial).Hash
-    if ($actual -ne $Sha256) { throw "下载文件校验失败：$Destination" }
+    if ($actual -ne $Sha256) { throw "Downloaded file checksum mismatch: $Destination" }
     Move-Item -Force -LiteralPath $partial -Destination $Destination
 }
 
@@ -19,15 +19,15 @@ try {
         Push-Location -LiteralPath (Join-Path $taskRoot 'frontend')
         try {
             npm ci
-            if ($LASTEXITCODE -ne 0) { throw '前端依赖安装失败。' }
+            if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed.' }
             npm run build
-            if ($LASTEXITCODE -ne 0) { throw '界面构建失败。' }
+            if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
         } finally { Pop-Location }
     }
     $modelArguments = @()
     if (-not $SkipFaceModels) {
         python -c "import cv2, numpy"
-        if ($LASTEXITCODE -ne 0) { throw '完整 Windows 版需要先安装 .[faces] 可选依赖。' }
+        if ($LASTEXITCODE -ne 0) { throw 'Install the .[faces] optional dependencies for the full Windows build.' }
         $modelRoot = Join-Path $taskRoot 'build/face-models'
         New-Item -ItemType Directory -Force -Path $modelRoot | Out-Null
         $commit = '47534e27c9851bb1128ccc0102f1145e27f23f98'
@@ -46,10 +46,10 @@ try {
     # Normal startup stays asInvoker; elevation is a separate explicit UAC action.
     $pyinstallerArguments = @('--noconfirm', '--clean', '--onefile', '--name', 'FileAtlas', '--manifest', 'scripts/fileatlas.manifest', '--add-data', 'frontend/dist;frontend/dist', '--collect-all', 'PIL', '--exclude-module', 'pillow_heif', '--exclude-module', '_pillow_heif') + $modelArguments + @('run.py')
     python -m PyInstaller @pyinstallerArguments
-    if ($LASTEXITCODE -ne 0) { throw 'Windows 程序构建失败。' }
+    if ($LASTEXITCODE -ne 0) { throw 'Windows executable build failed.' }
     $releaseArguments = @('scripts/prepare_windows_release.py')
     if ($SkipFaceModels) { $releaseArguments += '--without-face-models' }
     python @releaseArguments
-    if ($LASTEXITCODE -ne 0) { throw 'Windows 发布包校验或打包失败。' }
+    if ($LASTEXITCODE -ne 0) { throw 'Windows release validation or packaging failed.' }
     Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $taskRoot 'dist/FileAtlas.exe')
 } finally { Pop-Location }

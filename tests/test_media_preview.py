@@ -269,8 +269,9 @@ def test_optional_video_conversion_is_limited_and_forbids_nested_protocols(media
     def convert(command, source, snapshot, *, output=None, timeout=15):
         calls.append(command)
         assert str(path) not in command
-        assert command[command.index('-protocol_whitelist') + 1] == 'pipe'
-        assert command[command.index('-i') + 1] == 'pipe:0'
+        assert set(command[command.index('-protocol_whitelist') + 1].split(',')) == {'fd', 'pipe'}
+        assert command[command.index('-fd') + 1] == '0'
+        assert command[command.index('-i') + 1] == 'fd:'
         assert command[command.index('-t') + 1] == '30'
         output.write(b'bounded MP4 preview bytes')
         return SimpleNamespace(returncode=0)
@@ -320,7 +321,8 @@ def test_raw_embedded_jpeg_preview_needs_no_external_decoder(media_app):
     embedded = BytesIO()
     Image.new('RGB', (320, 180), 'green').save(embedded, 'JPEG')
     path = media_app.test_source / 'camera.arw'
-    original = b'RAW test header\x00' + embedded.getvalue() + b'\x00sensor data'
+    # Camera maker notes can contain false JPEG starts before the real preview.
+    original = b'RAW test header\x00' + b'\xff\xd8\xffinvalid\x00' * 12 + embedded.getvalue() + b'\x00sensor data'
     path.write_bytes(original)
     with request(media_app, '/api/preview', register(media_app, path)) as response:
         descriptor = json.load(response)
@@ -331,17 +333,27 @@ def test_raw_embedded_jpeg_preview_needs_no_external_decoder(media_app):
     assert path.read_bytes() == original
 
 
-def test_real_optional_ffmpeg_avi_preview_is_playable_mp4(media_app, monkeypatch):
+@pytest.mark.parametrize('extension', ['.avi', '.mp4'])
+def test_real_optional_ffmpeg_preview_has_decodable_frames(media_app, monkeypatch, extension):
     ffmpeg = shutil.which('ffmpeg')
     ffprobe = shutil.which('ffprobe')
     if not ffmpeg or not ffprobe:
         pytest.skip('Optional FFmpeg tools are not installed')
-    source = media_app.test_source / 'short.avi'
+    source = media_app.test_source / ('short' + extension)
     result = subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
                              '-i', 'testsrc=size=96x64:rate=5', '-t', '1', '-c:v', 'mpeg4',
                              str(source)], capture_output=True, timeout=15)
     if result.returncode:
         pytest.skip('Host FFmpeg lacks the fixture encoder')
+    if extension == '.mp4':
+        import struct
+        # Keep chunk offsets intact, but place the final movie index beyond the
+        # decoder's read buffer. pipe:0 can read the index yet cannot seek back
+        # to frames, and previously published an empty but valid-looking MP4.
+        data = source.read_bytes()
+        index = data.index(b'moov') - 4
+        padding = struct.pack('>I4s', 256 * 1024, b'free') + bytes(256 * 1024 - 8)
+        source.write_bytes(data[:index] + padding + data[index:])
     original = source.read_bytes()
     monkeypatch.setattr(media_app.app, '_preview_tool', lambda name: ffmpeg if name == 'ffmpeg' else ffprobe)
     with request(media_app, '/api/preview', register(media_app, source)) as response:
@@ -350,11 +362,13 @@ def test_real_optional_ffmpeg_avi_preview_is_playable_mp4(media_app, monkeypatch
     with request(media_app, descriptor['url'], auth=False) as response:
         preview_bytes = response.read()
     assert b'ftyp' in preview_bytes[:32]
-    probe = subprocess.run([ffprobe, '-v', 'error', '-show_entries', 'stream=codec_name',
+    probe = subprocess.run([ffprobe, '-v', 'error', '-count_frames',
+                            '-show_entries', 'stream=codec_name,nb_read_frames',
                             '-of', 'json', '-i', 'pipe:0'], input=preview_bytes,
                            capture_output=True, timeout=10)
     assert probe.returncode == 0
     assert json.loads(probe.stdout)['streams'][0]['codec_name'] == 'h264'
+    assert int(json.loads(probe.stdout)['streams'][0]['nb_read_frames']) > 0
     assert source.read_bytes() == original
 
 
