@@ -7,9 +7,11 @@ import stat
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+from fileatlas import engine as engine_module
 from fileatlas.engine import Engine, JournalError, QUARANTINE, SafetyError
 
 
@@ -215,6 +217,114 @@ class EngineSafetyTests(unittest.TestCase):
         result = self.engine.execute(plan['id'])
         self.assertEqual('completed', result['status'], result)
         self.assertEqual(b'preexisting', old_target.read_bytes())
+
+    def test_near_component_limit_filenames_copy_move_and_restore(self):
+        for length in (207, 224, 255):
+            folder = self.source / f'length-{length}'
+            original = self.file('x' * (length - 4) + '.txt', b'long name original data', root=folder)
+            for operation in ('copy', 'move'):
+                with self.subTest(length=length, operation=operation):
+                    plan = self.scan(operation=operation, sources=[folder])
+                    self.assertEqual(1, len(plan['items']))
+                    target = Path(plan['items'][0]['destination'])
+                    self.assertEqual(length, len(target.name))
+                    result = self.engine.execute(plan['id'])
+                    self.assertEqual('completed', result['status'], result)
+                    self.assertEqual(b'long name original data', target.read_bytes())
+                    self.assertEqual(operation == 'copy', original.exists())
+                    restored = self.engine.restore(result['id'])
+                    self.assertEqual('restored', restored['status'], restored)
+                    self.assertEqual(b'long name original data', original.read_bytes())
+                    self.assertFalse(target.exists())
+                    self.assertEqual([], list(self.destination.rglob('*.tmp')))
+
+    @contextmanager
+    def rename_changes_file_id(self):
+        """Emulate a FAT-style ID change for both paths and existing handles."""
+        snapshot = engine_module._snapshot
+        publish = engine_module._publish_no_replace
+        renamed = {}
+
+        def filesystem_snapshot(info):
+            result = snapshot(info)
+            identity = (info.st_dev, info.st_ino)
+            if identity in renamed:
+                result['inode'] = renamed[identity]
+            return result
+
+        def rename(temp, destination):
+            info = temp.lstat()
+            publish(temp, destination)
+            renamed[(info.st_dev, info.st_ino)] = info.st_ino + (1 << 128)
+
+        with patch('fileatlas.engine._snapshot', side_effect=filesystem_snapshot), \
+                patch('fileatlas.engine._publish_no_replace', side_effect=rename):
+            yield
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows FAT/exFAT rename identity regression')
+    def test_rename_changed_identity_is_journalled_and_copy_move_undo_work(self):
+        for operation in ('copy', 'move'):
+            with self.subTest(operation=operation), self.rename_changes_file_id():
+                folder = self.source / operation
+                original = self.file(root=folder)
+                plan = self.scan(operation=operation, sources=[folder])
+                target = Path(plan['items'][0]['destination'])
+                result = self.engine.execute(plan['id'])
+                self.assertEqual('completed', result['status'], result)
+                self.assertEqual(operation == 'copy', original.exists())
+                self.assertEqual(b'important original data', target.read_bytes())
+                records = [json.loads(line) for line in (self.state / f"{plan['id']}.jsonl").read_text(encoding='utf-8').splitlines()]
+                before = next(row['snapshot'] for row in records if row['event'] == 'copy_ready')
+                after = next(row['snapshot'] for row in records if row['event'] == 'published')
+                self.assertNotEqual(before['inode'], after['inode'])
+                self.assertEqual({k: v for k, v in before.items() if k != 'inode'},
+                                 {k: v for k, v in after.items() if k != 'inode'})
+                restored = Engine(self.state).restore(plan['id'])
+                self.assertEqual('restored', restored['status'], restored)
+                self.assertEqual(b'important original data', original.read_bytes())
+                self.assertFalse(target.exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows pinned publication regression')
+    def test_replaced_destination_during_publication_preserves_source_and_both_targets(self):
+        original = self.file()
+        plan = self.scan(operation='move')
+        target = Path(plan['items'][0]['destination'])
+        displaced = self.base / 'displaced-verified-copy.txt'
+        publish = engine_module._publish_no_replace
+
+        def replace_after_rename(temp, destination):
+            publish(temp, destination)
+            destination.rename(displaced)
+            destination.write_bytes(original.read_bytes())
+            # Same bytes and times cannot substitute for the bound file identity.
+            import shutil
+            shutil.copystat(displaced, destination)
+
+        with patch('fileatlas.engine._publish_no_replace', side_effect=replace_after_rename):
+            result = self.engine.execute(plan['id'])
+        self.assertEqual('partial', result['status'], result)
+        self.assertEqual(0, result['completed'])
+        self.assertEqual('publish_destination', result['errors'][0]['phase'])
+        for path in (original, target, displaced):
+            self.assertEqual(b'important original data', path.read_bytes())
+        records = [json.loads(line) for line in (self.state / f"{plan['id']}.jsonl").read_text(encoding='utf-8').splitlines()]
+        self.assertFalse(any(row['event'] in ('published', 'remove_intent') for row in records))
+        restored = Engine(self.state).restore(plan['id'])
+        self.assertEqual('restore_partial', restored['status'], restored)
+        self.assertTrue(original.exists())
+        self.assertTrue(target.exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows FAT/exFAT crash recovery regression')
+    def test_crash_before_new_identity_record_preserves_both_copies_for_review(self):
+        original = self.file()
+        plan = self.scan(operation='move')
+        target = Path(plan['items'][0]['destination'])
+        with self.rename_changes_file_id():
+            self.crash_at('published', lambda: self.engine.execute(plan['id']))
+            restored = Engine(self.state).restore(plan['id'])
+            self.assertEqual('restore_partial', restored['status'], restored)
+            self.assertEqual(b'important original data', original.read_bytes())
+            self.assertEqual(b'important original data', target.read_bytes())
 
     def test_target_appearing_after_preview_is_never_overwritten(self):
         original = self.file()

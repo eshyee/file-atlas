@@ -18,6 +18,7 @@ import stat
 import threading
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -219,6 +220,48 @@ def _publish_no_replace(temp, destination):
         os.link(temp, destination, follow_symlinks=False)
 
 
+@contextmanager
+def _open_windows_publish_handle(path, expected):
+    """Pin the verified staging file across rename, without permitting writers.
+
+    FAT/exFAT can change a file's ID during rename.  A handle to that same file
+    lets us obtain its new ID without accepting an unrelated destination file.
+    FILE_SHARE_DELETE permits rename; deliberately omitting FILE_SHARE_WRITE
+    prevents a new writer while identity and content are being verified.
+    """
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _file_info(path, expected)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    # GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, OPEN_EXISTING,
+    # FILE_FLAG_OPEN_REPARSE_POINT: no elevation or backup privileges required.
+    handle = kernel.CreateFileW(str(path), 0x80000000, 5, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        kernel.CloseHandle(handle)
+        raise
+    try:
+        stream = os.fdopen(descriptor, 'rb')
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or _linked(info) or not _matches(info, expected):
+            raise SafetyError(f'发布时暂存文件发生变化，来源已保留：{path}')
+        _file_info(path, expected)
+        yield stream
+
+
 def _path_guard(path, *, projects=True):
     """Check *all* existing components without following links or junctions."""
     path = _absolute(path)
@@ -344,7 +387,10 @@ def _named_streams(path):
     handle = kernel.FindFirstStreamW(str(path), 0, ctypes.byref(data), 0)
     if handle == ctypes.c_void_p(-1).value:
         error = ctypes.get_last_error()
-        if error in (1, 38, 50):  # No streams / filesystem does not implement ADS.
+        # FindFirstStreamW documents ERROR_INVALID_PARAMETER (87) for file
+        # systems without stream support, including exFAT/FAT. This applies
+        # only to the initial lookup; enumeration errors still fail closed.
+        if error in (1, 38, 50, 87):
             return []
         raise ctypes.WinError(error)
     streams = []
@@ -761,7 +807,9 @@ class Engine:
             _safe_mkdir(destination.parent)
         except (OSError, ValueError) as exc:
             raise _OperationFailure(exc, phase) from exc
-        temp = destination.with_name(f'.{destination.name}.fileatlas-{uuid.uuid4().hex}.tmp')
+        # A source filename can already occupy the full 255-character component
+        # limit. Keep the exclusive staging name short and independent of it.
+        temp = destination.parent / f'.fileatlas-{uuid.uuid4().hex}.tmp'
         event_prefix = 'restore_' if restoring else ''
         self._append(journal, event_prefix + 'stage_intent', item_id=item_id, temp=str(temp))
         created_snapshot = None
@@ -809,10 +857,29 @@ class Engine:
             _file_info(temp, created_snapshot)
             if _exists(destination):
                 raise SafetyError(f'目标在执行时出现，绝不覆盖：{destination}')
-            _publish_no_replace(temp, destination)
-            _sync_directory(destination.parent)
-            published_snapshot = _snapshot(_file_info(destination, created_snapshot))
-            self._append(journal, event_prefix + 'published', item_id=item_id, snapshot=published_snapshot)
+            if os.name == 'nt':
+                with _open_windows_publish_handle(temp, created_snapshot) as bound:
+                    _publish_no_replace(temp, destination)
+                    published_snapshot = _snapshot(os.fstat(bound.fileno()))
+                    # Only the ID of this SAME open file may change on rename.
+                    # Every other snapshot check, including recovery, stays exact.
+                    if any(published_snapshot[key] != created_snapshot[key]
+                           for key in ('size', 'mtime_ns', 'device')):
+                        raise SafetyError(f'发布时副本属性发生变化，来源已保留：{destination}')
+                    _file_info(destination, published_snapshot)
+                    _verify(destination, published_snapshot, digest, cancel)
+                    if not _matches(os.fstat(bound.fileno()), published_snapshot):
+                        raise SafetyError(f'发布时副本发生变化，来源已保留：{destination}')
+                    _file_info(destination, published_snapshot)
+                    # Keep the pinned handle until the new identity is durable;
+                    # no source deletion is allowed before this journal record.
+                    self._append(journal, event_prefix + 'published', item_id=item_id,
+                                 snapshot=published_snapshot)
+            else:
+                _publish_no_replace(temp, destination)
+                _sync_directory(destination.parent)
+                published_snapshot = _snapshot(_file_info(destination, created_snapshot))
+                self._append(journal, event_prefix + 'published', item_id=item_id, snapshot=published_snapshot)
             if _exists(temp):
                 phase = 'cleanup_stage'
                 _file_info(temp, created_snapshot)

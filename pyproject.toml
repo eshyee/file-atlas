@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fileatlas"
-version = "1.1.1"
+version = "1.1.2"
 description = "归序 File Atlas: local file organization, exact deduplication, media preview and face indexing"
 readme = "readme.md"
 requires-python = ">=3.11"

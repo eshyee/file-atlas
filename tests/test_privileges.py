@@ -221,7 +221,7 @@ def test_packaged_manifest_preserves_as_invoker_policy():
     root = ElementTree.parse(Path(__file__).resolve().parents[1] / 'scripts' / 'fileatlas.manifest')
     identity = root.find('.//{urn:schemas-microsoft-com:asm.v1}assemblyIdentity')
     level = root.find('.//{urn:schemas-microsoft-com:asm.v3}requestedExecutionLevel')
-    assert identity.attrib['version'] == '1.1.1.0'
+    assert identity.attrib['version'] == '1.1.2.0'
     assert level.attrib == {'level': 'asInvoker', 'uiAccess': 'false'}
 
 
