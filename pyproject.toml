@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fileatlas"
+version = "1.0.0"
+description = "归序 File Atlas: local, preview-first file classification, exact deduplication and drive merging"
+readme = "readme.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["Pillow>=11.0,<14"]
+
+[project.optional-dependencies]
+desktop = ["pywebview>=5,<7"]
+heif = ["pillow-heif>=0.21"]
+dev = ["pytest>=8,<10", "pyinstaller>=6.11,<7"]
+
+[project.scripts]
+fileatlas = "fileatlas.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["fileatlas*"]
+
+[tool.setuptools.package-data]
+fileatlas = ["web/*", "web/assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
