@@ -66,7 +66,7 @@ def test_source_relaunch_uses_own_module_without_original_arguments(monkeypatch,
     data_dir = tmp_path / '任务 records & more'
     executable, arguments, directory = privileges._elevation_command(['--data-dir', str(data_dir), '--desktop'])
     assert executable == str(Path(sys.executable).resolve())
-    assert arguments == ['-I', '-c', privileges._SOURCE_BOOTSTRAP,
+    assert arguments == ['-I', '-X', 'utf8', '-c', privileges._SOURCE_BOOTSTRAP,
                          str(Path(privileges.__file__).resolve().parent.parent),
                          '--elevated-child', '--data-dir', str(data_dir), '--desktop']
     assert directory == str(Path(privileges.__file__).resolve().parent.parent)
@@ -84,24 +84,30 @@ def test_real_isolated_source_bootstrap_imports_project_without_customizers(monk
         'from pathlib import Path\nPath(' + repr(str(marker)) + ').write_text("ran")\n', encoding='utf-8')
     (trap / 'usercustomize.py').write_text(
         'from pathlib import Path\nPath(' + repr(str(marker)) + ').write_text("ran")\n', encoding='utf-8')
-    environment = {**os.environ, 'PYTHONPATH': str(trap), 'PYTHONUSERBASE': str(trap)}
+    environment = {**os.environ, 'PYTHONPATH': str(trap), 'PYTHONUSERBASE': str(trap),
+                   'PYTHONIOENCODING': 'ascii:strict', 'PYTHONUTF8': '0'}
     executable, arguments, directory = privileges._elevation_command([])
     # --help exits during parsing, before token checks, UAC or any file service.
     result = subprocess.run([executable, *arguments, '--help'], cwd=trap,
                             env=environment, capture_output=True, timeout=15)
     assert result.returncode == 0, result.stderr
     assert b'--request-admin' in result.stdout
+    assert '安全分类' in result.stdout.decode('utf-8')
     assert not marker.exists()
     diagnostic = (
         "import json,site,sys; sys.path.insert(0,sys.argv[1]); import fileatlas; "
         "print(json.dumps({'isolated':sys.flags.isolated,'user_site':site.ENABLE_USER_SITE,"
+        "'utf8_mode':sys.flags.utf8_mode,'stdout_encoding':sys.stdout.encoding,"
         "'project':fileatlas.__file__,'path':sys.path,"
         "'sitecustomize':getattr(sys.modules.get('sitecustomize'),'__file__','')}))"
     )
-    inspected = subprocess.run([executable, '-I', '-c', diagnostic, directory], cwd=trap,
+    interpreter_options = arguments[:arguments.index('-c')]
+    inspected = subprocess.run([executable, *interpreter_options, '-c', diagnostic, directory], cwd=trap,
                               env=environment, capture_output=True, timeout=15, check=True)
     state = json.loads(inspected.stdout)
     assert state['isolated'] == 1
+    assert state['utf8_mode'] == 1
+    assert state['stdout_encoding'].lower().replace('-', '') == 'utf8'
     assert state['user_site'] is False
     assert Path(state['project']).resolve() == Path(directory) / 'fileatlas' / '__init__.py'
     assert str(trap) not in state['path']

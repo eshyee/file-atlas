@@ -118,8 +118,9 @@ def _elevation_command(extra_args):
         return str(executable), ['--elevated-child', *preferences], str(executable.parent)
     package_root = Path(__file__).resolve().parent.parent
     # Isolate startup from PYTHONPATH, the caller's cwd, user-site .pth files and
-    # user customizers. Add only this resolved application root after startup.
-    return str(executable), ['-I', '-c', _SOURCE_BOOTSTRAP, str(package_root),
+    # user customizers. UTF-8 also keeps redirected Chinese help/status output
+    # independent of the Windows locale. Add only this application root.
+    return str(executable), ['-I', '-X', 'utf8', '-c', _SOURCE_BOOTSTRAP, str(package_root),
                              '--elevated-child', *preferences], str(package_root)
 
 
