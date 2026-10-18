@@ -24,8 +24,8 @@ export async function api(path, options = {}) {
   return options.blob ? response.blob() : response.json();
 }
 
-export const post = (path, data) => api(path, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+export const post = (path, data, options = {}) => api(path, {
+  ...options, method: 'POST', headers: { 'Content-Type': 'application/json', ...options.headers }, body: JSON.stringify(data),
 });
 
 export function getPlan(id, kind = 'items', offset = 0, limit = 100, signal) {

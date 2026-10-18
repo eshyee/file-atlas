@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { post } from './api.js';
 import { Toggle, Notice } from './components.jsx';
+import PrivilegeControl from './Privileges.jsx';
 import { Folder, Files, FolderClosed, ChevronDown, ArrowRight, ShieldCheck, X, Merge, LoaderCircle } from './icons.js';
 
 const categories = [{ id: 'picture', label: '照片与图片' }, { id: 'video', label: '视频' }, { id: 'audio', label: '音频' }, { id: 'document', label: '文档' }];
@@ -11,7 +12,7 @@ const modes = [
 
 export const initialConfig = mode => ({ sources: [], destination: '', mode, operation: 'copy', include_structured: false, categories: categories.map(c => c.id) });
 
-export default function Setup({ config, setConfig, onScan, onModeChange, onError, busy }) {
+export default function Setup({ config, setConfig, onScan, onModeChange, onError, busy, privileges, onElevate }) {
   const [path, setPath] = useState('');
   const [picking, setPicking] = useState(null);
   const [advanced, setAdvanced] = useState(false);
@@ -50,7 +51,7 @@ export default function Setup({ config, setConfig, onScan, onModeChange, onError
     <section className="panel options-panel" aria-labelledby="options-title"><h2 id="options-title">整理选项</h2>
       {config.mode !== 'dedup' ? <div className="destination-field"><label htmlFor="destination">{config.mode === 'merge' ? '选择归并后的保存位置' : '选择分类后的保存位置'}</label><div className="input-button"><input id="destination" value={config.destination} onChange={event => update({ destination: event.target.value })} placeholder="例如：D:\归序整理后的文件" autoComplete="off" spellCheck="false" /><button type="button" className="button secondary" onClick={() => pick('destination')} disabled={Boolean(picking)}>{picking === 'destination' ? <LoaderCircle size={16} className="spin" /> : '浏览'}</button></div></div> : <p className="dedup-note"><ShieldCheck size={18} />重复副本会移入原文件夹内的隔离区，至少保留一份原件，可从任务记录恢复。</p>}
       <div className="toggle-row">{config.mode !== 'dedup' && <Toggle checked={config.operation === 'copy'} onChange={event => update({ operation: event.target.checked ? 'copy' : 'move' })} hint="复制完成并验证内容后，原文件仍保留。">默认复制，保留原文件</Toggle>}<Toggle checked locked hint="始终跳过系统、程序、开发工程、链接及归序隔离区。">保护工程与系统目录</Toggle></div>
-      {config.operation === 'move' && config.mode !== 'dedup' && <Notice type="warning"><strong>已选择移动</strong><p>验证目标文件完整后才移除原文件。确认整理时，需要再次同意此操作。</p></Notice>}
+      {config.operation === 'move' && config.mode !== 'dedup' && <><Notice type="warning"><strong>已选择移动</strong><p>验证目标文件完整后才移除原文件。确认整理时，需要再次同意此操作。</p></Notice>{privileges && !privileges.elevated && <div className="move-permission"><div><strong>当前是标准权限</strong><p>普通文件可以直接移动；如果 Windows 拒绝访问，请先以管理员权限重新启动，再重新扫描。</p></div><PrivilegeControl status={privileges} onElevate={onElevate} compact /></div>}</>}
       <button type="button" className="disclosure" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}><ChevronDown size={17} className={advanced ? 'rotated' : ''} />更多选项</button>
       {advanced && <div className="advanced-options">{config.mode === 'classify' ? <><fieldset><legend>要分类的文件类型</legend><div className="category-options">{categories.map(category => <label key={category.id}><input type="checkbox" checked={config.categories.includes(category.id)} onChange={event => update({ categories: event.target.checked ? [...config.categories, category.id] : config.categories.filter(value => value !== category.id) })} />{category.label}</label>)}</div><p className="field-help">未勾选的类型和不支持的格式会列入跳过清单。</p></fieldset><label className="check-label"><input type="checkbox" checked={config.include_structured} onChange={event => update({ include_structured: event.target.checked })} />将 JSON、YAML 等配置文件也归入文档</label><p className="field-help">默认保留这类配置文件，避免拆散配套资料；工程目录始终受保护。</p></> : <p className="field-help">系统目录、工程目录、符号链接、快捷链接与归序隔离区始终受保护。可以在扫描后查看具体跳过原因。</p>}</div>}
     </section>

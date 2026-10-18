@@ -24,3 +24,15 @@ export { default as LoaderCircle } from 'lucide-react/dist/esm/icons/loader-circ
 export { default as Merge } from 'lucide-react/dist/esm/icons/merge';
 export { default as Search } from 'lucide-react/dist/esm/icons/search';
 export { default as RefreshCw } from 'lucide-react/dist/esm/icons/refresh-cw';
+export { default as ScanFace } from 'lucide-react/dist/esm/icons/scan-face';
+export { default as Images } from 'lucide-react/dist/esm/icons/images';
+export { default as Image } from 'lucide-react/dist/esm/icons/image';
+export { default as Play } from 'lucide-react/dist/esm/icons/play';
+export { default as Film } from 'lucide-react/dist/esm/icons/film';
+export { default as Maximize2 } from 'lucide-react/dist/esm/icons/maximize-2';
+export { default as UserRound } from 'lucide-react/dist/esm/icons/user-round';
+export { default as UsersRound } from 'lucide-react/dist/esm/icons/users-round';
+export { default as KeyRound } from 'lucide-react/dist/esm/icons/key-round';
+export { default as Shield } from 'lucide-react/dist/esm/icons/shield';
+export { default as Settings2 } from 'lucide-react/dist/esm/icons/settings-2';
+export { default as ExternalLink } from 'lucide-react/dist/esm/icons/external-link';

@@ -23,8 +23,24 @@ def main():
     parser.add_argument('--data-dir', type=Path, default=default_data_dir(), help='本地任务日志位置')
     parser.add_argument('--no-browser', action='store_true', help='仅启动服务，在控制台显示本次访问地址')
     parser.add_argument('--desktop', action='store_true', help='使用可选 pywebview 独立窗口')
+    parser.add_argument('--request-admin', action='store_true', help='请求 Windows UAC，以管理员权限打开一个新会话')
+    parser.add_argument('--elevated-child', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--pick-dialog', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    from .privileges import ElevationError, get_privilege_status, relaunch_elevated
+    privileges = get_privilege_status()
+    if args.elevated_child and (privileges['platform'] != 'windows' or not privileges['elevated']):
+        parser.error('新会话未取得管理员权限，已停止启动；不会重复弹出权限请求。')
+    if args.request_admin and privileges['reason'] != 'elevated':
+        preferences = ['--data-dir', str(args.data_dir.resolve())]
+        if args.desktop:
+            preferences.append('--desktop')
+        try:
+            result = relaunch_elevated(preferences)
+        except (ElevationError, ValueError) as exc:
+            parser.error(str(exc))
+        print(result['message'], flush=True)
+        return
     if args.pick_dialog:
         import tkinter as tk
         from tkinter import filedialog
@@ -43,7 +59,7 @@ def main():
         static_dir = Path(__file__).resolve().parent / 'web'
     if not (static_dir / 'index.html').is_file():
         parser.error('界面尚未构建。请先在 frontend 目录执行 npm ci 和 npm run build。')
-    server = create_server(args.data_dir, static_dir, args.port)
+    server = create_server(args.data_dir, static_dir, args.port, desktop=args.desktop)
     url = f'http://127.0.0.1:{server.server_port}/#{server.app.token}'
     if args.desktop:
         try:
@@ -62,6 +78,7 @@ def main():
         else:
             webbrowser.open(url)
             print('归序已在浏览器中打开。关闭此窗口或按 Ctrl+C 退出。', flush=True)
+            print(privileges['display'], flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
